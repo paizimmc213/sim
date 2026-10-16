@@ -170,3 +170,28 @@
   margin-top: 10px;
   display: none;
 }
+
+.duttyfy-pix-error #duttyfyPixErrorText {
+  display: block;
+}
+
+.duttyfy-pix-retry-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 10px 18px;
+  background: #FB9637;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: 0.2s;
+}
+
+.duttyfy-pix-retry-btn:hover {
+  background: #E8850A;
+}

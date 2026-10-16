@@ -56,7 +56,19 @@ const PIX_MODAL_HTML = `
           id="duttyfyPixError"
           style="display:none;"
         >
-          Erro ao gerar PIX. Tente novamente.
+          <span id="duttyfyPixErrorText">
+            Erro ao gerar PIX. Tente novamente.
+          </span>
+
+          <button
+            type="button"
+            class="duttyfy-pix-retry-btn"
+            id="duttyfyPixRetryBtn"
+            onclick="retryPixModal()"
+            style="display:none;"
+          >
+            Gerar novo PIX
+          </button>
         </div>
       </div>
 
@@ -119,13 +131,55 @@ const PIX_MODAL_HTML = `
 
 /* =========================================================
    CONFIGURAÇÃO
+
+   Estratégia de chamada:
+   1. Primeiro tenta os proxies locais (/api/*) — usados
+      em produção (Vercel), onde a página é HTTPS e o
+      browser bloquearia chamada direta para http://.
+   2. Se o proxy não existir (ex.: teste local no Live
+      Server), cai automaticamente na URL direta do
+      servidor de pagamentos (serverblack-pagamento),
+      que libera CORS.
+
+   O middleware devolve sempre o mesmo formato, não
+   importa qual gateway está ativo (CrazyPay ou Blackcat).
 ========================================================= */
 
-const BLACKCAT_SERVER =
+const PIX_API_BASE =
   '/api';
 
-const BLACKCAT_CREATE_URL =
-  `${BLACKCAT_SERVER}/payments`;
+const PIX_DIRECT_API =
+  'http://6ugawbqcezxwcxhsz4lma6xx.153.75.84.96.sslip.io/api';
+
+
+/*
+ * Dados usados quando o funil não tem a informação
+ * do cliente salva no localStorage — evita que o
+ * modal trave pedindo e-mail/telefone/CPF.
+ *
+ * Ajuste aqui se quiser trocar os valores padrão.
+ */
+const PIX_FALLBACK_CUSTOMER = {
+
+  firstName:
+    'Cliente',
+
+  /*
+   * O middleware exige ao menos 1 caractere
+   * no sobrenome — não deixe vazio.
+   */
+  lastName:
+    'Silva',
+
+  email:
+    'cliente@duttyfy.com',
+
+  phone:
+    '11999999999',
+
+  cpf:
+    '52998224725'
+};
 
 
 /* =========================================================
@@ -137,6 +191,183 @@ let pixPollingTimeout = null;
 
 let currentSuccessUrl = '';
 let currentTransactionId = '';
+
+/*
+ * Guarda a última chamada para o botão
+ * "Gerar novo PIX" repetir sem perder dados.
+ */
+let lastPixRequest = null;
+
+/*
+ * Define qual base de API foi usada com sucesso
+ * por último: false = proxy local, true = direta.
+ * O polling de status segue a mesma base da criação.
+ */
+let pixDirectMode = false;
+
+
+/*
+ * Status finais do gateway conforme a documentação
+ * do servidor de pagamentos.
+ */
+const PIX_FAILED_STATUSES =
+  ['REFUSED', 'FAILED', 'ERROR', 'CANCELLED'];
+
+const PIX_EXPIRED_STATUS =
+  'EXPIRED';
+
+const PIX_REVOKED_STATUSES =
+  ['REFUNDED', 'CHARGEBACK'];
+
+
+/* =========================================================
+   CHAMADA À API (proxy primeiro, direta como fallback)
+========================================================= */
+
+/**
+ * Tenta o proxy local (/api) e, se ele não responder
+ * como esperado (Live Server, 404, HTML, sem CORS),
+ * cai na URL direta do middleware.
+ *
+ * Devolve { response, data } ou lança o erro de negócio.
+ */
+async function requestPixApi(
+  path,
+  fetchOptions = {}
+) {
+
+  const bases =
+    [
+      { url: PIX_API_BASE, direct: false },
+      { url: PIX_DIRECT_API, direct: true }
+    ];
+
+
+  let lastInfraError =
+    null;
+
+
+  for (const base of bases) {
+
+    try {
+
+      const response =
+        await fetch(
+          `${base.url}${path}`,
+          fetchOptions
+        );
+
+
+      let data;
+
+      try {
+
+        data =
+          await response.json();
+
+      } catch {
+
+        /*
+         * Resposta não-JSON (página HTML de 404/405,
+         * servidor estático etc.) = infraestrutura.
+         */
+        throw Object.assign(
+          new Error(
+            `O servidor respondeu em formato inesperado (HTTP ${response.status}).`
+          ),
+          { pixInfra: true }
+        );
+      }
+
+
+      /*
+       * Erro de negócio (4xx/5xx em JSON).
+       *
+       * 5xx do proxy local = infraestrutura — tenta
+       * a URL direta. 4xx = problema real do payload
+       * (422) ou do gateway — repassa sem fallback.
+       */
+      if (
+        !response.ok
+      ) {
+
+        if (
+          response.status >= 500 &&
+          !base.direct
+        ) {
+
+          lastInfraError =
+            new Error(
+              data.error ||
+              'O proxy local falhou.'
+            );
+
+          lastInfraError.pixInfra =
+            true;
+
+          continue;
+        }
+
+
+        const error =
+          new Error(
+            data.error ||
+            'Erro na API de pagamento.'
+          );
+
+        error.status =
+          response.status;
+
+        error.data =
+          data;
+
+
+        throw error;
+      }
+
+
+      /*
+       * Sucesso — fixa a base usada para o polling.
+       */
+      pixDirectMode =
+        base.direct;
+
+
+      return {
+        response,
+        data
+      };
+
+    } catch (error) {
+
+      /*
+       * Erro de rede (conexão recusada, CORS,
+       * conteúdo misto bloqueado) também é infra.
+       */
+      if (
+        error.pixInfra ||
+        error instanceof TypeError
+      ) {
+
+        lastInfraError =
+          error;
+
+        continue;
+      }
+
+
+      throw error;
+    }
+  }
+
+
+  throw (
+    lastInfraError ||
+    new Error(
+      'Não foi possível falar com o servidor de pagamento.'
+    )
+  );
+}
 
 
 /* =========================================================
@@ -184,7 +415,7 @@ function injectPixModalDependencies() {
       'duttyfyPixModalScript';
 
     script.src =
-      'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+      'https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js';
 
     document.head.appendChild(script);
   }
@@ -252,6 +483,17 @@ async function openPixModal(
 ) {
 
   injectPixModalDependencies();
+
+  /*
+   * Salva os dados da chamada para o retry
+   * poder gerar uma nova cobrança idêntica.
+   */
+  lastPixRequest = {
+    amountCents,
+    itemTitle,
+    successUrl,
+    options
+  };
 
   currentSuccessUrl =
     successUrl || '/';
@@ -334,7 +576,7 @@ async function openPixModal(
   const rawCpf =
     options.customer?.cpf ||
     localStorage.getItem('cpf') ||
-    '';
+    PIX_FALLBACK_CUSTOMER.cpf;
 
   const cpf =
     String(rawCpf)
@@ -345,7 +587,7 @@ async function openPixModal(
     options.customer?.phone ||
     localStorage.getItem('telephone') ||
     localStorage.getItem('telefone') ||
-    '';
+    PIX_FALLBACK_CUSTOMER.phone;
 
   const phone =
     String(rawPhone)
@@ -361,26 +603,26 @@ async function openPixModal(
   const email =
     options.customer?.email ||
     localStorage.getItem('email') ||
-    '';
+    PIX_FALLBACK_CUSTOMER.email;
 
 
   /*
    * Nome completo
    */
-  const firstName =
+  let firstName =
     options.customer?.firstName ||
     storedName.trim().split(/\s+/)[0] ||
     'Cliente';
 
 
-  const lastName =
+  let lastName =
     options.customer?.lastName ||
     storedName
       .trim()
       .split(/\s+/)
       .slice(1)
       .join(' ') ||
-    '';
+    PIX_FALLBACK_CUSTOMER.lastName;
 
 
   /* =======================================================
@@ -487,46 +729,28 @@ async function openPixModal(
 
 
   /* =======================================================
-     VALIDAR CLIENTE
+     CLIENTE
+
+     Não valida mais nome/e-mail/telefone/CPF:
+     o que não vier do funil é preenchido com
+     PIX_FALLBACK_CUSTOMER (seção CONFIGURAÇÃO).
   ======================================================= */
 
-  if (!firstName) {
+  if (
+    !firstName.trim()
+  ) {
 
-    mostrarErroPix(
-      'Informe o nome do cliente.'
-    );
-
-    return;
+    firstName =
+      PIX_FALLBACK_CUSTOMER.firstName;
   }
 
 
-  if (!email) {
+  if (
+    !lastName.trim()
+  ) {
 
-    mostrarErroPix(
-      'Informe o e-mail do cliente.'
-    );
-
-    return;
-  }
-
-
-  if (!phone) {
-
-    mostrarErroPix(
-      'Informe o telefone do cliente.'
-    );
-
-    return;
-  }
-
-
-  if (!cpf) {
-
-    mostrarErroPix(
-      'Informe o CPF do cliente.'
-    );
-
-    return;
+    lastName =
+      PIX_FALLBACK_CUSTOMER.lastName;
   }
 
 
@@ -566,14 +790,70 @@ async function openPixModal(
 
 
   /*
-   * A nova API não documenta campos UTM.
+   * A API aceita o objeto `utm` e repassa os pares
+   * ao gateway como metadata.
    *
-   * Portanto não enviamos UTMs para evitar
-   * mandar campos desconhecidos.
-   *
-   * Se o servidor aceitar metadata no futuro,
-   * podemos acrescentar.
+   * Primeiro tenta os parâmetros da URL atual; se não
+   * houver, usa o primeiro toque salvo pelo tracking
+   * em localStorage (`_utms`) — nos upsells a URL já
+   * não carrega mais os UTMs.
    */
+
+  let storedUtms = {};
+
+  try {
+
+    storedUtms =
+      JSON.parse(
+        localStorage.getItem('_utms') ||
+        '{}'
+      );
+
+  } catch {
+
+    storedUtms = {};
+  }
+
+
+  const utm = {};
+
+
+  const utmFields = {
+
+    utm_source:
+      utmSource ||
+      storedUtms.utm_source,
+
+    utm_medium:
+      utmMedium ||
+      storedUtms.utm_medium,
+
+    utm_campaign:
+      utmCampaign ||
+      storedUtms.utm_campaign,
+
+    utm_content:
+      utmContent ||
+      storedUtms.utm_content,
+
+    utm_term:
+      utmTerm ||
+      storedUtms.utm_term
+  };
+
+
+  for (
+    const [key, value]
+    of
+    Object.entries(utmFields)
+  ) {
+
+    if (value) {
+
+      utm[key] =
+        String(value);
+    }
+  }
 
 
   /* =======================================================
@@ -628,15 +908,34 @@ async function openPixModal(
   };
 
 
+  /*
+   * UTMs — só envia se houver algum valor.
+   */
+  if (
+    Object.keys(utm).length
+  ) {
+
+    payload.utm =
+      utm;
+  }
+
+
   /* =======================================================
      CRIAR COBRANÇA
   ======================================================= */
 
   try {
 
-    const response =
-      await fetch(
-        BLACKCAT_CREATE_URL,
+    /*
+     * Proxy local primeiro; URL direta do middleware
+     * como fallback automático (ver requestPixApi).
+     *
+     * Erros de negócio (422, 4xx do gateway) voltam
+     * como exceção com error.status e error.data.
+     */
+    const { data } =
+      await requestPixApi(
+        '/payments',
         {
           method: 'POST',
 
@@ -651,66 +950,6 @@ async function openPixModal(
             )
         }
       );
-
-
-    let data;
-
-    try {
-
-      data =
-        await response.json();
-
-    } catch {
-
-      throw new Error(
-        'O servidor retornou uma resposta inválida.'
-      );
-    }
-
-
-    /*
-     * Erro HTTP
-     */
-    if (!response.ok) {
-
-      console.error(
-        'Erro API PIX:',
-        data
-      );
-
-
-      if (
-        response.status === 422 &&
-        Array.isArray(data.issues)
-      ) {
-
-        throw new Error(
-          data.issues
-            .map(issue => {
-
-              if (
-                typeof issue === 'string'
-              ) {
-                return issue;
-              }
-
-              return (
-                issue.message ||
-                issue.error ||
-                JSON.stringify(issue)
-              );
-
-            })
-            .join(' | ')
-        );
-      }
-
-
-      throw new Error(
-        data.error ||
-        'Não foi possível gerar o PIX.'
-      );
-    }
 
 
     /* =====================================================
@@ -804,33 +1043,46 @@ async function openPixModal(
 
 
     /*
-     * Gerar QR Code
+     * Gerar QR Code.
+     *
+     * Usa qrcode-generator (kazuhikoarase) em vez do
+     * qrcodejs: o código PIX do gateway vem longo e o
+     * qrcodejs estoura ("code length overflow"), pois a
+     * tabela de capacidade dele para cedo. Esta lib vai
+     * até a versão 40 do QR (~3 KB de payload).
      */
     await waitForQRCode();
 
 
-    new QRCode(
-      qrContainer,
-      {
-        text:
-          data.qrCode,
+    const qr =
+      qrcode(
+        0,      /* typeNumber 0 = versão automática */
+        'M'     /* correção de erro; sobra espaço p/ payload grande */
+      );
 
-        width:
-          200,
-
-        height:
-          200,
-
-        colorDark:
-          '#000000',
-
-        colorLight:
-          '#ffffff',
-
-        correctLevel:
-          QRCode.CorrectLevel.H
-      }
+    qr.addData(
+      data.qrCode
     );
+
+    qr.make();
+
+
+    /*
+     * SVG escalável — ocupa os 200px do container
+     * (.duttyfy-pix-qr-code) sem perder qualidade.
+     */
+    qrContainer.innerHTML =
+      qr.createSvgTag({
+        cellSize: 4,
+        margin: 4,
+        scalable: true
+      });
+
+    qrContainer.style.display =
+      'block';
+
+    qrContainer.style.opacity =
+      '1';
 
 
     /*
@@ -849,6 +1101,40 @@ async function openPixModal(
     );
 
 
+    /*
+     * Erro de validação (422): junta os campos
+     * com problema em uma única mensagem.
+     */
+    if (
+      error.status === 422 &&
+      Array.isArray(error.data?.issues)
+    ) {
+
+      mostrarErroPix(
+        error.data.issues
+          .map(issue => {
+
+            if (
+              typeof issue === 'string'
+            ) {
+              return issue;
+            }
+
+            return (
+              issue.message ||
+              issue.error ||
+              JSON.stringify(issue)
+            );
+
+          })
+          .join(' | ')
+      );
+
+
+      return;
+    }
+
+
     mostrarErroPix(
       error.message ||
       'Erro ao gerar PIX. Tente novamente.'
@@ -865,13 +1151,16 @@ async function openPixModal(
  * Consulta:
  *
  * GET
- * https://https://supersimcredito.vercel.app/api/payments/:id/status
+ * /api/payments/:id/status
+ * (ou a URL direta do middleware, conforme o modo
+ * usado na criação da cobrança)
  *
- * Retorno:
+ * Retorno oficial:
  *
  * {
  *   paid: true,
- *   status: "PAID"
+ *   status: "PAID",
+ *   raw: { }
  * }
  */
 async function checkPixStatus(
@@ -886,52 +1175,116 @@ async function checkPixStatus(
   }
 
 
-  const url =
-    `${BLACKCAT_SERVER}/payments/${encodeURIComponent(transactionId)}/status`;
+  const bases =
+    pixDirectMode
+      ? [PIX_DIRECT_API, PIX_API_BASE]
+      : [PIX_API_BASE, PIX_DIRECT_API];
 
 
-  const response =
-    await fetch(
-      url,
-      {
-        method: 'GET',
+  let lastError =
+    null;
 
-        headers: {
-          'Accept':
-            'application/json'
-        },
 
-        cache:
-          'no-store'
+  for (const base of bases) {
+
+    try {
+
+      const response =
+        await fetch(
+          `${base}/payments/${encodeURIComponent(transactionId)}/status`,
+          {
+            method: 'GET',
+
+            headers: {
+              'Accept':
+                'application/json'
+            },
+
+            cache:
+              'no-store'
+          }
+        );
+
+
+      let data;
+
+      try {
+
+        data =
+          await response.json();
+
+      } catch {
+
+        throw Object.assign(
+          new Error(
+            'Resposta inválida ao consultar pagamento.'
+          ),
+          { pixInfra: true }
+        );
       }
-    );
 
 
-  let data;
+      if (!response.ok) {
 
-  try {
+        if (
+          response.status >= 500 &&
+          !pixDirectMode
+        ) {
 
-    data =
-      await response.json();
+          lastError =
+            Object.assign(
+              new Error(
+                data.error ||
+                'Erro ao consultar pagamento.'
+              ),
+              { pixInfra: true }
+            );
 
-  } catch {
+          continue;
+        }
 
-    throw new Error(
-      'Resposta inválida ao consultar pagamento.'
-    );
+
+        throw new Error(
+          data.error ||
+          'Erro ao consultar pagamento.'
+        );
+      }
+
+
+      /*
+       * Sucesso — fixa o modo para as próximas.
+       */
+      pixDirectMode =
+        base === PIX_DIRECT_API;
+
+
+      return data;
+
+    } catch (error) {
+
+      if (
+        error.pixInfra ||
+        error instanceof TypeError
+      ) {
+
+        lastError =
+          error;
+
+        continue;
+      }
+
+
+      throw error;
+    }
   }
 
 
-  if (!response.ok) {
-
-    throw new Error(
-      data.error ||
+  throw (
+    lastError ||
+    new Error(
       'Erro ao consultar pagamento.'
-    );
-  }
-
-
-  return data;
+    )
+  );
 }
 
 
@@ -994,7 +1347,11 @@ function startPixPolling(
 
 
   /*
-   * Depois consulta a cada 5 segundos.
+   * Depois consulta a cada 4 segundos.
+   *
+   * A documentação recomenda consultar de 3 em 3
+   * a 5 em 5 segundos até o pagamento confirmar
+   * ou o PIX expirar.
    */
   pixPollingInterval =
     setInterval(
@@ -1005,7 +1362,7 @@ function startPixPolling(
         );
 
       },
-      5000
+      4000
     );
 
 
@@ -1019,40 +1376,10 @@ function startPixPolling(
         stopPixPolling();
 
 
-        const errorMsg =
-          document.getElementById(
-            'duttyfyPixError'
-          );
-
-
-        errorMsg.innerText =
-          'Tempo expirado. Gere um novo PIX para continuar.';
-
-        errorMsg.style.display =
-          'block';
-
-
-        const qr =
-          document.getElementById(
-            'duttyfyPixQrCode'
-          );
-
-
-        if (qr) {
-
-          qr.style.opacity =
-            '0.2';
-        }
-
-
-        const status =
-          document.getElementById(
-            'duttyfyPixStatus'
-          );
-
-
-        status.style.display =
-          'none';
+        mostrarErroPix(
+          'Tempo expirado. Gere um novo PIX para continuar.',
+          { retry: true }
+        );
 
       },
       900000
@@ -1133,27 +1460,81 @@ async function checkPixPaymentNow(
 
 
     /*
-     * Caso tenha sido cancelado/falhado.
+     * Status oficial do gateway (sempre maiúsculo):
+     *
+     * PENDING  — aguardando; continua consultando
+     * PAID     — pago; libera o pedido
+     * EXPIRED  — venceu; oferece uma nova cobrança
+     * REFUSED, FAILED, ERROR, CANCELLED
+     *          — não processado; oferece uma nova cobrança
+     * REFUNDED, CHARGEBACK
+     *          — dinheiro devolvido; revoga o acesso
+     */
+    const gatewayStatus =
+      String(
+        data.status || ''
+      ).toUpperCase();
+
+
+    /*
+     * Dinheiro devolvido pelo gateway.
      */
     if (
-      data.status === 'CANCELLED' ||
-      data.status === 'FAILED'
+      PIX_REVOKED_STATUSES.includes(
+        gatewayStatus
+      )
     ) {
 
       stopPixPolling();
 
 
-      const errorMsg =
-        document.getElementById(
-          'duttyfyPixError'
-        );
+      mostrarErroPix(
+        'Pagamento devolvido pelo gateway. Gere um novo PIX para continuar.',
+        { retry: true }
+      );
 
 
-      errorMsg.innerText =
-        'O pagamento não foi concluído. Gere um novo PIX.';
+      return;
+    }
 
-      errorMsg.style.display =
-        'block';
+
+    /*
+     * PIX vencido.
+     */
+    if (
+      gatewayStatus ===
+      PIX_EXPIRED_STATUS
+    ) {
+
+      stopPixPolling();
+
+
+      mostrarErroPix(
+        'O PIX expirou. Gere um novo código para continuar.',
+        { retry: true }
+      );
+
+
+      return;
+    }
+
+
+    /*
+     * Recusado / falhou / erro.
+     */
+    if (
+      PIX_FAILED_STATUSES.includes(
+        gatewayStatus
+      )
+    ) {
+
+      stopPixPolling();
+
+
+      mostrarErroPix(
+        'O pagamento não foi concluído. Gere um novo PIX.',
+        { retry: true }
+      );
 
 
       return;
@@ -1318,7 +1699,7 @@ function waitForQRCode() {
     (resolve, reject) => {
 
       if (
-        window.QRCode
+        window.qrcode
       ) {
 
         resolve();
@@ -1339,7 +1720,7 @@ function waitForQRCode() {
 
 
             if (
-              window.QRCode
+              window.qrcode
             ) {
 
               clearInterval(
@@ -1380,7 +1761,8 @@ function waitForQRCode() {
 ========================================================= */
 
 function mostrarErroPix(
-  message
+  message,
+  options = {}
 ) {
 
   const loader =
@@ -1439,13 +1821,76 @@ function mostrarErroPix(
 
   if (errorMsg) {
 
-    errorMsg.innerText =
-      message ||
-      'Erro ao gerar PIX. Tente novamente.';
-
     errorMsg.style.display =
       'block';
   }
+
+
+  /*
+   * Texto do erro fica no span interno,
+   * para não apagar o botão de retry.
+   */
+  const errorText =
+    document.getElementById(
+      'duttyfyPixErrorText'
+    );
+
+
+  if (errorText) {
+
+    errorText.innerText =
+      message ||
+      'Erro ao gerar PIX. Tente novamente.';
+  }
+
+
+  /*
+   * Botão "Gerar novo PIX" — exibido quando o
+   * erro permite tentar uma nova cobrança
+   * (expirado, recusado, timeout etc.).
+   */
+  const retryBtn =
+    document.getElementById(
+      'duttyfyPixRetryBtn'
+    );
+
+
+  if (retryBtn) {
+
+    retryBtn.style.display =
+      options.retry
+        ? 'inline-flex'
+        : 'none';
+  }
+}
+
+
+/* =========================================================
+   TENTAR NOVAMENTE
+========================================================= */
+
+/**
+ * Repete a última chamada de openPixModal com os
+ * mesmos dados — usado pelo botão "Gerar novo PIX".
+ */
+function retryPixModal() {
+
+  if (
+    !lastPixRequest
+  ) {
+
+    closePixModal();
+
+    return;
+  }
+
+
+  openPixModal(
+    lastPixRequest.amountCents,
+    lastPixRequest.itemTitle,
+    lastPixRequest.successUrl,
+    lastPixRequest.options
+  );
 }
 
 
@@ -1509,3 +1954,6 @@ window.startPixPolling =
 
 window.checkLastPixPayment =
   checkLastPixPayment;
+
+window.retryPixModal =
+  retryPixModal;

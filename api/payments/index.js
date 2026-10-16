@@ -1,41 +1,19 @@
 /**
  * POST /api/payments
- * Cria uma cobrança Pix no CrazyPay.
+ * Cria uma cobrança PIX encaminhando para o servidor de pagamentos
+ * (serverblack-pagamento), que repassa ao gateway ativo (CrazyPay ou
+ * Blackcat) e devolve sempre o mesmo formato:
  *
- * Variáveis de ambiente (Vercel > Settings > Environment Variables):
- *   CRAZYPAY_PUBLIC_KEY
- *   CRAZYPAY_SECRET_KEY
+ *   201 { "id": "...", "qrCode": "000201...", "expiresAt": "..." }
+ *
+ * Por que não chamar o middleware direto do navegador?
+ * A URL dele é HTTP e o site roda em HTTPS — o browser bloquearia por
+ * conteúdo misto. Este proxy da Vercel resolve isso e ainda repassa o
+ * IP real do comprador (o middleware lê X-Forwarded-For).
  */
 
-const BASE_URL = 'https://api.crazypay.app';
-
-function getAuthHeader() {
-  const pub = process.env.CRAZYPAY_PUBLIC_KEY;
-  const sec = process.env.CRAZYPAY_SECRET_KEY;
-  if (!pub || !sec) return null;
-  return 'Basic ' + Buffer.from(`${pub}:${sec}`).toString('base64');
-}
-
-/* Procura em qualquer nível da resposta um texto que seja um Pix copia e cola
-   (todo código Pix EMV começa com "000201"). */
-function findPixCode(value) {
-  if (typeof value === 'string') {
-    return value.startsWith('000201') && value.length > 50 ? value : null;
-  }
-  if (value && typeof value === 'object') {
-    for (const key of Object.keys(value)) {
-      const found = findPixCode(value[key]);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function normalizePhone(phone) {
-  const digits = String(phone || '').replace(/\D/g, '');
-  if (digits.length === 10 || digits.length === 11) return '55' + digits;
-  return digits;
-}
+const MIDDLEWARE_URL =
+  'http://6ugawbqcezxwcxhsz4lma6xx.153.75.84.96.sslip.io/api';
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -45,81 +23,32 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: 'Método não permitido.' });
   }
 
-  const authorization = getAuthHeader();
-  if (!authorization) {
-    console.error('Faltam CRAZYPAY_PUBLIC_KEY / CRAZYPAY_SECRET_KEY na Vercel.');
-    return res.status(500).json({ error: 'Pagamento indisponível no momento.' });
-  }
-
   const body = req.body || {};
-  const customer = body.customer || {};
-  const amount = Math.round(Number(body.amount));
-  const externalRef = String(body.externalRef || `PEDIDO-${Date.now()}`);
 
-  /* ---------- validações básicas ---------- */
-  const issues = [];
-  if (!Number.isFinite(amount) || amount <= 0) issues.push('Valor inválido.');
-  if (!customer.email) issues.push('E-mail do cliente é obrigatório.');
-  if (!customer.cpf) issues.push('CPF do cliente é obrigatório.');
-  if (!customer.phone) issues.push('Telefone do cliente é obrigatório.');
-  if (issues.length) {
-    return res.status(422).json({ error: 'Dados inválidos.', issues });
-  }
-
-  /* ---------- itens (valores em CENTAVOS) ---------- */
-  const cart = Array.isArray(body.cart) ? body.cart : [];
-  let items = cart.map((item) => ({
-    title: String(item.nome || 'Produto').slice(0, 255),
-    unit_price: Math.round(Number(item.unitPrice) * 100),
-    quantity: Number(item.quantity) || 1,
-    tangible: true,
-    external_ref: externalRef,
-  }));
-
-  const itemsTotal = items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0);
-
-  /* Se a soma dos itens não bate com o total (frete, desconto etc.),
-     manda um item único com o valor total para não dar erro. */
-  if (!items.length || itemsTotal !== amount) {
-    items = [
-      {
-        title: String(body.title || `Pedido ${externalRef}`).slice(0, 255),
-        unit_price: amount,
-        quantity: 1,
-        tangible: true,
-        external_ref: externalRef,
-      },
-    ];
-  }
-
-  const name = `${customer.firstName || ''} ${customer.lastName || ''}`.trim() || 'Cliente';
-  const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || '127.0.0.1';
-
+  /* Só repassa os campos oficiais do contrato. */
   const payload = {
-    payment_method: 'pix',
-    amount,
-    customer: {
-      name,
-      email: String(customer.email),
-      document: {
-        type: 'cpf',
-        number: String(customer.cpf).replace(/\D/g, ''),
-      },
-      phone: normalizePhone(customer.phone),
-    },
-    items,
-    pix: { expires_in_days: 1 },
-    metadata: { provider_name: 'API Pix' },
-    ip,
+    amount: body.amount,
+    externalRef: body.externalRef,
+    cart: Array.isArray(body.cart) ? body.cart : undefined,
+    customer: body.customer,
+    utm: body.utm && typeof body.utm === 'object' ? body.utm : undefined,
   };
 
+  Object.keys(payload).forEach(
+    (key) => payload[key] === undefined && delete payload[key]
+  );
+
+  /* IP real do comprador — sem isso o gateway registraria o IP da Vercel. */
+  const clientIp = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+
   try {
-    const response = await fetch(`${BASE_URL}/v1/payment-transaction/create`, {
+    const response = await fetch(`${MIDDLEWARE_URL}/payments`, {
       method: 'POST',
       headers: {
-        accept: 'application/json',
-        authorization,
-        'content-type': 'application/json',
+        'Content-Type': 'application/json',
+        ...(clientIp ? { 'X-Forwarded-For': clientIp } : {}),
       },
       body: JSON.stringify(payload),
     });
@@ -128,39 +57,59 @@ module.exports = async (req, res) => {
     try {
       data = await response.json();
     } catch {
-      console.error('CrazyPay respondeu algo que não é JSON. HTTP', response.status);
-      return res.status(502).json({ error: 'Resposta inválida do gateway.' });
+      console.error(
+        'Servidor de pagamento respondeu algo que não é JSON. HTTP',
+        response.status
+      );
+      return res
+        .status(502)
+        .json({ error: 'Resposta inválida do servidor de pagamento.' });
     }
 
-    if (!response.ok || data.success === false) {
-      console.error('CrazyPay erro:', response.status, JSON.stringify(data));
-      const messages = Array.isArray(data.error_messages)
-        ? data.error_messages.map((m) => (typeof m === 'string' ? m : m.message || JSON.stringify(m)))
-        : [];
-      return res.status(422).json({
-        error: 'Não foi possível gerar o PIX.',
-        issues: messages,
+    if (!response.ok) {
+      console.error(
+        'Servidor de pagamento erro:',
+        response.status,
+        JSON.stringify(data)
+      );
+
+      /* Mantém o formato oficial de erro: { error, issues? }.
+         O pix-modal.js usa `issues` para montar a mensagem do 422. */
+      return res.status(response.status === 422 ? 422 : 502).json({
+        error: data.error || 'Não foi possível gerar o PIX.',
+        ...(Array.isArray(data.issues) ? { issues: data.issues } : {}),
       });
     }
 
-    const qrCode = findPixCode(data);
-
-    if (!data.id || !qrCode) {
-      /* Fica registrado nos Logs da Vercel para a gente ajustar o campo certo. */
-      console.error('Resposta sem id/qrCode. Resposta completa:', JSON.stringify(data));
-      return res.status(502).json({ error: 'O gateway não retornou o código PIX.' });
+    if (!data.id || !data.qrCode) {
+      console.error(
+        'Resposta sem id/qrCode:',
+        JSON.stringify(data)
+      );
+      return res
+        .status(502)
+        .json({ error: 'O servidor não retornou o código PIX.' });
     }
+
+    /*
+     * O gateway às vezes devolve a data zero ("0001-01-01...")
+     * quando não há expiração — trata como vazio.
+     */
+    const expiresAt =
+      data.expiresAt &&
+      !String(data.expiresAt).startsWith('0001-01-01')
+        ? data.expiresAt
+        : null;
 
     return res.status(200).json({
       id: String(data.id),
-      qrCode,
-      expiresAt:
-        (data.pix && (data.pix.expiration_date || data.pix.expires_at)) ||
-        data.expires_at ||
-        null,
+      qrCode: data.qrCode,
+      expiresAt,
     });
   } catch (error) {
-    console.error('Falha ao chamar CrazyPay:', error);
-    return res.status(502).json({ error: 'Não foi possível falar com o gateway.' });
+    console.error('Falha ao chamar o servidor de pagamento:', error);
+    return res
+      .status(502)
+      .json({ error: 'Não foi possível falar com o servidor de pagamento.' });
   }
 };

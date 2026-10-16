@@ -1,19 +1,20 @@
 /**
  * GET /api/payments/:id/status
- * Consulta o status da transação no CrazyPay e devolve no formato
- * que o pix-modal.js já espera: { paid: true/false, status: "..." }
+ * Encaminha a consulta para o servidor de pagamentos (serverblack-pagamento)
+ * e devolve o formato oficial:
+ *
+ *   { "paid": true, "status": "PAID", "raw": { } }
+ *
+ * Status possíveis (sempre maiúsculos):
+ *   PENDING — aguardando pagamento; continue consultando
+ *   PAID — pago; libere o pedido
+ *   EXPIRED — PIX venceu; gere uma nova cobrança
+ *   REFUSED, FAILED, ERROR — não processado; ofereça uma nova cobrança
+ *   REFUNDED, CHARGEBACK — dinheiro devolvido; revogue o acesso
  */
 
-const BASE_URL = 'https://api.crazypay.app';
-
-function getAuthHeader() {
-  const pub = process.env.CRAZYPAY_PUBLIC_KEY;
-  const sec = process.env.CRAZYPAY_SECRET_KEY;
-  if (!pub || !sec) return null;
-  return 'Basic ' + Buffer.from(`${pub}:${sec}`).toString('base64');
-}
-
-const FAILED_STATUSES = ['REFUSED', 'FAILED', 'EXPIRED', 'ERROR'];
+const MIDDLEWARE_URL =
+  'http://6ugawbqcezxwcxhsz4lma6xx.153.75.84.96.sslip.io/api';
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -23,12 +24,6 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: 'Método não permitido.' });
   }
 
-  const authorization = getAuthHeader();
-  if (!authorization) {
-    console.error('Faltam CRAZYPAY_PUBLIC_KEY / CRAZYPAY_SECRET_KEY na Vercel.');
-    return res.status(500).json({ error: 'Pagamento indisponível no momento.' });
-  }
-
   const id = req.query.id;
   if (!id) {
     return res.status(400).json({ error: 'ID da transação não informado.' });
@@ -36,38 +31,46 @@ module.exports = async (req, res) => {
 
   try {
     const response = await fetch(
-      `${BASE_URL}/v1/payment-transaction/info/${encodeURIComponent(id)}`,
+      `${MIDDLEWARE_URL}/payments/${encodeURIComponent(id)}/status`,
       {
         method: 'GET',
-        headers: { accept: 'application/json', authorization },
+        headers: { Accept: 'application/json' },
       }
     );
-
-    if (response.status === 404) {
-      return res.status(404).json({ error: 'Transação não encontrada.' });
-    }
 
     let data;
     try {
       data = await response.json();
     } catch {
-      return res.status(502).json({ error: 'Resposta inválida do gateway.' });
+      console.error(
+        'Servidor de pagamento respondeu algo que não é JSON. HTTP',
+        response.status
+      );
+      return res
+        .status(502)
+        .json({ error: 'Resposta inválida do servidor de pagamento.' });
     }
 
     if (!response.ok) {
-      console.error('CrazyPay status erro:', response.status, JSON.stringify(data));
-      return res.status(502).json({ error: 'Erro ao consultar pagamento.' });
+      console.error(
+        'Servidor de pagamento status erro:',
+        response.status,
+        JSON.stringify(data)
+      );
+      return res.status(response.status === 404 ? 404 : 502).json({
+        error: data.error || 'Erro ao consultar pagamento.',
+      });
     }
 
-    const raw = String(data.status || 'PENDING').toUpperCase();
-    const paid = raw === 'PAID';
-
     return res.status(200).json({
-      paid,
-      status: paid ? 'PAID' : FAILED_STATUSES.includes(raw) ? 'FAILED' : 'PENDING',
+      paid: data.paid === true,
+      status: String(data.status || 'PENDING').toUpperCase(),
+      raw: data.raw,
     });
   } catch (error) {
-    console.error('Falha ao consultar CrazyPay:', error);
-    return res.status(502).json({ error: 'Não foi possível falar com o gateway.' });
+    console.error('Falha ao consultar o servidor de pagamento:', error);
+    return res
+      .status(502)
+      .json({ error: 'Não foi possível falar com o servidor de pagamento.' });
   }
 };
